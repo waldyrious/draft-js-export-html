@@ -1,23 +1,31 @@
 /* @flow */
 
 import {Entity} from 'draft-js';
+import {isUnitlessNumber} from 'react/lib/CSSProperty';
 import {
   getEntityRanges,
   BLOCK_TYPE,
   ENTITY_TYPE,
   INLINE_STYLE,
 } from 'draft-js-utils';
-import styleToCssString from './styleToCssString';
 
 import type {ContentState, ContentBlock, EntityInstance} from 'draft-js';
 import type {CharacterMetaList} from 'draft-js-utils';
 
-type StringMap = {[key: string]: ?string};
-type AttrMap = {[key: string]: StringMap};
-type CustomStyleMap = {[styleName: string]: { [key: string]: string }};
+type AttrMap = {[key: string]: string};
+type Attributes = {[key: string]: string};
+type StyleDescr = {[key: string]: number | string};
+
+type RenderConfig = {
+  element?: string;
+  attributes?: Attributes;
+  style?: StyleDescr;
+};
+
+type StyleMap = {[styleName: string]: RenderConfig};
 
 type Options = {
-  customStyleMap?: CustomStyleMap;
+  inlineStyles?: StyleMap;
 };
 
 const {
@@ -31,16 +39,39 @@ const {
 const INDENT = '  ';
 const BREAK = '<br>';
 const DATA_ATTRIBUTE = /^data-([a-z0-9-]+)$/;
+const NUMERIC_STRING = /^\d+$/;
+const UPPERCASE_PATTERN = /([A-Z])/g;
+const MS_PATTERN = /^ms-/;
+
+// Lifted from: https://github.com/facebook/react/blob/master/src/renderers/dom/shared/HTMLDOMPropertyConfig.js
+const ATTR_NAME_MAP = {
+  acceptCharset: 'accept-charset',
+  className: 'class',
+  htmlFor: 'for',
+  httpEquiv: 'http-equiv',
+};
+
+const DEFAULT_STYLE_MAP = {
+  [BOLD]: {element: 'strong'},
+  [CODE]: {element: 'code'},
+  [ITALIC]: {element: 'em'},
+  [STRIKETHROUGH]: {element: 'del'},
+  [UNDERLINE]: {element: 'ins'},
+};
+
+// Order: inner-most style to outer-most.
+// Examle: <em><strong>foo</strong></em>
+const DEFAULT_STYLE_ORDER = [BOLD, ITALIC, UNDERLINE, STRIKETHROUGH, CODE];
 
 // Map entity data to element attributes.
-const ENTITY_ATTR_MAP: AttrMap = {
+const ENTITY_ATTR_MAP: {[entityType: string]: AttrMap} = {
   [ENTITY_TYPE.LINK]: {url: 'href', rel: 'rel', target: 'target', title: 'title', className: 'class'},
   [ENTITY_TYPE.IMAGE]: {src: 'src', height: 'height', width: 'width', alt: 'alt', className: 'class'},
 };
 
 // Map entity data to element attributes.
 const DATA_TO_ATTR = {
-  [ENTITY_TYPE.LINK](entityType: string, entity: EntityInstance): StringMap {
+  [ENTITY_TYPE.LINK](entityType: string, entity: EntityInstance): Attributes {
     const attrMap = ENTITY_ATTR_MAP.hasOwnProperty(entityType) ? ENTITY_ATTR_MAP[entityType] : {};
     const data = entity.getData();
     const attrs = {};
@@ -55,7 +86,7 @@ const DATA_TO_ATTR = {
     }
     return attrs;
   },
-  [ENTITY_TYPE.IMAGE](entityType: string, entity: EntityInstance): StringMap {
+  [ENTITY_TYPE.IMAGE](entityType: string, entity: EntityInstance): Attributes {
     let attrMap = ENTITY_ATTR_MAP.hasOwnProperty(entityType) ? ENTITY_ATTR_MAP[entityType] : {};
     let data = entity.getData();
     let attrs = {};
@@ -64,6 +95,8 @@ const DATA_TO_ATTR = {
       if (attrMap.hasOwnProperty(dataKey)) {
         let attrKey = attrMap[dataKey];
         attrs[attrKey] = dataValue;
+      } else if (DATA_ATTRIBUTE.test(dataKey)) {
+        attrs[dataKey] = dataValue;
       }
     }
     return attrs;
@@ -109,6 +142,73 @@ function getWrapperTag(blockType: string): ?string {
   }
 }
 
+function getStyleMap(customMap: ?StyleMap): [StyleMap, Array<string>] {
+  if (customMap == null) {
+    return [DEFAULT_STYLE_MAP, DEFAULT_STYLE_ORDER];
+  }
+  let styleMap = {...DEFAULT_STYLE_MAP};
+  let styleOrder = [...DEFAULT_STYLE_ORDER];
+  for (let styleName of Object.keys(customMap)) {
+    if (DEFAULT_STYLE_MAP.hasOwnProperty(styleName)) {
+      let defaultStyles = DEFAULT_STYLE_MAP[styleName];
+      styleMap[styleName] = {...defaultStyles, ...customMap[styleName]};
+    } else {
+      styleMap[styleName] = customMap[styleName];
+      styleOrder.push(styleName);
+    }
+  }
+  return [styleMap, styleOrder];
+}
+
+function styleToCSS(styleDescr: StyleDescr): string {
+  let parts = Object.keys(styleDescr).map((name) => {
+    let styleValue = processStyleValue(name, styleDescr[name]);
+    let styleName = processStyleName(name);
+    return `${styleName}: ${styleValue}`;
+  });
+  return parts.join('; ');
+}
+
+// Lifted from: https://github.com/facebook/react/blob/master/src/renderers/dom/shared/CSSPropertyOperations.js
+function processStyleName(name: string): string {
+  return name
+    .replace(UPPERCASE_PATTERN, '-$1')
+    .toLowerCase()
+    .replace(MS_PATTERN, '-ms-');
+}
+
+// Lifted from: https://github.com/facebook/react/blob/master/src/renderers/dom/shared/dangerousStyleValue.js
+function processStyleValue(name: string, value: number | string): string {
+  let isNumeric;
+  if (typeof value === 'string') {
+    isNumeric = NUMERIC_STRING.test(value);
+  } else {
+    isNumeric = true;
+    value = String(value);
+  }
+  if (!isNumeric || value === '0' || isUnitlessNumber[name] === true) {
+    return value;
+  } else {
+    return value + 'px';
+  }
+}
+
+function normalizeAttributes(attributes: ?Attributes, attrNameMap: AttrMap) {
+  if (attributes == null) {
+    return attributes;
+  }
+  let normalized = {};
+  let didNormalize = false;
+  for (let name of Object.keys(attributes)) {
+    if (attrNameMap.hasOwnProperty(name)) {
+      name = attrNameMap[name];
+      didNormalize = true;
+    }
+    normalized[name] = attributes[name];
+  }
+  return didNormalize ? normalized : attributes;
+}
+
 class MarkupGenerator {
   blocks: Array<ContentBlock>;
   contentState: ContentState;
@@ -117,11 +217,17 @@ class MarkupGenerator {
   output: Array<string>;
   totalBlocks: number;
   wrapperTag: ?string;
-  customStyleMap: CustomStyleMap;
+  inlineStyles: StyleMap;
+  styleOrder: Array<string>;
 
-  constructor(contentState: ContentState, options: Options) {
+  constructor(contentState: ContentState, options: ?Options) {
+    if (options == null) {
+      options = {};
+    }
     this.contentState = contentState;
-    this.customStyleMap = options.customStyleMap || {};
+    let [inlineStyles, styleOrder] = getStyleMap(options.inlineStyles);
+    this.inlineStyles = inlineStyles;
+    this.styleOrder = styleOrder;
   }
 
   generate(): string {
@@ -241,33 +347,28 @@ class MarkupGenerator {
     let charMetaList: CharacterMetaList = block.getCharacterList();
     let entityPieces = getEntityRanges(text, charMetaList);
     return entityPieces.map(([entityKey, stylePieces]) => {
-      let content = stylePieces.map(([text, style]) => {
+      let content = stylePieces.map(([text, styleSet]) => {
         let content = encodeContent(text);
-        // These are reverse alphabetical by tag name.
-        if (style.has(BOLD)) {
-          content = `<strong>${content}</strong>`;
-        }
-        if (style.has(UNDERLINE)) {
-          content = `<ins>${content}</ins>`;
-        }
-        if (style.has(ITALIC)) {
-          content = `<em>${content}</em>`;
-        }
-        if (style.has(STRIKETHROUGH)) {
-          content = `<del>${content}</del>`;
-        }
-        if (style.has(CODE)) {
-          // If our block type is CODE then we are already wrapping the whole
-          // block in a `<code>` so don't wrap inline code elements.
-          content = (blockType === BLOCK_TYPE.CODE) ? content : `<code>${content}</code>`;
-        }
-        // Apply custom styles supplied by the user
-        Object.keys(this.customStyleMap).forEach((key) => {
-          if (this.customStyleMap.hasOwnProperty(key) && style.has(key)) {
-            content = `<span style="${styleToCssString(this.customStyleMap[key])}">${content}</span>`;
+        for (let styleName of this.styleOrder) {
+          // If our block type is CODE then don't wrap inline code elements.
+          if (styleName === CODE && blockType === BLOCK_TYPE.CODE) {
+            continue;
           }
-        });
-
+          if (styleSet.has(styleName)) {
+            let {element, attributes, style} = this.inlineStyles[styleName];
+            if (element == null) {
+              element = 'span';
+            }
+            // Normalize `className` -> `class`
+            attributes = normalizeAttributes(attributes, ATTR_NAME_MAP);
+            if (style != null) {
+              let styleAttr = styleToCSS(style);
+              attributes = (attributes == null) ? {style: styleAttr} : {...attributes, style: styleAttr};
+            }
+            let attrString = stringifyAttrs(attributes);
+            content = `<${element}${attrString}>${content}</${element}>`;
+          }
+        }
         return content;
       }).join('');
       let entity = entityKey ? Entity.get(entityKey) : null;
@@ -275,12 +376,12 @@ class MarkupGenerator {
       let entityType = (entity == null) ? null : entity.getType().toUpperCase();
       if (entityType != null && entityType === ENTITY_TYPE.LINK) {
         let attrs = DATA_TO_ATTR.hasOwnProperty(entityType) ? DATA_TO_ATTR[entityType](entityType, entity) : null;
-        let strAttrs = stringifyAttrs(attrs);
-        return `<a${strAttrs}>${content}</a>`;
+        let attrString = stringifyAttrs(attrs);
+        return `<a${attrString}>${content}</a>`;
       } else if (entityType != null && entityType === ENTITY_TYPE.IMAGE) {
         let attrs = DATA_TO_ATTR.hasOwnProperty(entityType) ? DATA_TO_ATTR[entityType](entityType, entity) : null;
-        let strAttrs = stringifyAttrs(attrs);
-        return `<img${strAttrs}/>`;
+        let attrString = stringifyAttrs(attrs);
+        return `<img${attrString}/>`;
       } else {
         return content;
       }
@@ -306,15 +407,15 @@ class MarkupGenerator {
 
 }
 
-function stringifyAttrs(attrs) {
+function stringifyAttrs(attrs: ?Attributes) {
   if (attrs == null) {
     return '';
   }
   let parts = [];
-  for (let attrKey of Object.keys(attrs)) {
-    let attrValue = attrs[attrKey];
-    if (attrValue != null) {
-      parts.push(` ${attrKey}="${encodeAttr(attrValue + '')}"`);
+  for (let name of Object.keys(attrs)) {
+    let value = attrs[name];
+    if (value != null) {
+      parts.push(` ${name}="${encodeAttr(value + '')}"`);
     }
   }
   return parts.join('');
@@ -348,5 +449,5 @@ function encodeAttr(text: string): string {
 }
 
 export default function stateToHTML(content: ContentState, options: ?Options): string {
-  return new MarkupGenerator(content, options || {}).generate();
+  return new MarkupGenerator(content, options).generate();
 }
